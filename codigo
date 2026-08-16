@@ -1,0 +1,222 @@
+function Get-DiskSpaceReport {
+    param(
+        [string]$Drive = "C:\",
+        [int]$Top = 10,
+        [int]$Depth = 3,
+        [int]$MinGB = 1,
+        [string]$Output = (Join-Path ([Environment]::GetFolderPath('Desktop')) "disk-space-report.txt")
+    )
+
+    # Garante barra final na unidade/caminho
+    if (-not $Drive.EndsWith('\')) {
+        $Drive = "$Drive\"
+    }
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $files   = [System.Collections.Generic.List[object]]::new()
+
+    $total = $null
+    $used  = $null
+    $free  = $null
+
+    Write-Host "`n=== DISCO ===" -ForegroundColor Cyan
+
+    $disk = Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
+        Where-Object { $_.DeviceID -eq $Drive.TrimEnd('\') }
+
+    if ($disk) {
+        $total = [math]::Round($disk.Size / 1GB, 2)
+        $free  = [math]::Round($disk.FreeSpace / 1GB, 2)
+        $used  = [math]::Round(($disk.Size - $disk.FreeSpace) / 1GB, 2)
+
+        Write-Host "Unidade : $($disk.DeviceID)"
+        Write-Host "Total   : $total GB"
+        Write-Host "Usado   : $used GB"
+        Write-Host "Livre   : $free GB"
+    }
+    else {
+        Write-Host "Não foi possível obter informações da unidade '$Drive'. Continuando apenas com a varredura de pastas." -ForegroundColor Yellow
+    }
+
+    Write-Host "`n=== ESCANEANDO ===" -ForegroundColor Cyan
+    Write-Host "Isso pode demorar. Arquivos serão percorridos uma única vez.`n"
+
+    function Get-DirectorySizeRecursive {
+        param(
+            [string]$Path,
+            [int]$CurrentDepth
+        )
+
+        $totalSize = 0
+
+        $items = Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+
+        foreach ($item in $items) {
+
+            # Pula links simbólicos / junções / reparse points para evitar loop infinito ou contagem duplicada
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                continue
+            }
+
+            if ($item.PSIsContainer) {
+
+                $childSize = Get-DirectorySizeRecursive `
+                    -Path $item.FullName `
+                    -CurrentDepth ($CurrentDepth + 1)
+
+                $totalSize += $childSize
+            }
+            else {
+                $size = $item.Length
+                $totalSize += $size
+
+                if ($size -ge ($MinGB * 1GB)) {
+                    $files.Add([PSCustomObject]@{
+                        GB   = [math]::Round($size / 1GB, 2)
+                        Path = $item.FullName
+                    })
+                }
+            }
+        }
+
+        $results.Add([PSCustomObject]@{
+            Depth = $CurrentDepth
+            GB    = [math]::Round($totalSize / 1GB, 2)
+            Path  = $Path
+        })
+
+        return $totalSize
+    }
+
+    Get-DirectorySizeRecursive -Path $Drive -CurrentDepth 0 | Out-Null
+
+    Write-Host "`n=== MAIORES PASTAS ===" -ForegroundColor Cyan
+
+    $largest = $results |
+        Where-Object { $_.GB -ge $MinGB } |
+        Sort-Object GB -Descending
+
+    $topFolders = $largest | Select-Object -First $Top
+
+    $topFolders | Format-Table -AutoSize
+
+    Write-Host "`n=== INVESTIGAÇÃO POR NÍVEL ===" -ForegroundColor Cyan
+
+    $current = @($Drive)
+
+    for ($level = 1; $level -le $Depth; $level++) {
+
+        Write-Host "`n--- NÍVEL $level ---" -ForegroundColor Yellow
+
+        $next = @()
+
+        foreach ($parent in $current) {
+
+            $children = $results |
+                Where-Object {
+                    $_.Depth -eq $level -and
+                    $_.Path.StartsWith($parent, [StringComparison]::OrdinalIgnoreCase) -and
+                    ($_.Path.Substring($parent.Length).Trim('\') -notmatch '\\')
+                } |
+                Sort-Object GB -Descending |
+                Select-Object -First $Top
+
+            foreach ($child in $children) {
+                if ($child.GB -ge $MinGB) {
+                    Write-Host ("{0,8:N2} GB  {1}" -f $child.GB, $child.Path)
+                    $next += $child.Path
+                }
+            }
+        }
+
+        $current = $next
+    }
+
+    Write-Host "`n=== MAIORES ARQUIVOS ===" -ForegroundColor Cyan
+
+    $files |
+        Sort-Object GB -Descending |
+        Select-Object -First ($Top * 2) |
+        Format-Table -AutoSize
+
+    Write-Host "`n=== RELATÓRIO SALVO ===" -ForegroundColor Cyan
+
+    # Garante que a pasta de destino existe antes de salvar
+    $outDir = Split-Path -Path $Output -Parent
+    if (-not (Test-Path -LiteralPath $outDir)) {
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    }
+
+    $report = [System.Collections.Generic.List[string]]::new()
+
+    $report.Add("========================================")
+    $report.Add(" RELATÓRIO DE ESPAÇO EM DISCO")
+    $report.Add("========================================")
+    $report.Add("")
+    $report.Add("Unidade: $Drive")
+    if ($disk) {
+        $report.Add("Total : $total GB")
+        $report.Add("Usado : $used GB")
+        $report.Add("Livre : $free GB")
+    }
+    else {
+        $report.Add("Total/Usado/Livre: não disponível (unidade não encontrada)")
+    }
+    $report.Add("")
+
+    $report.Add("========================================")
+    $report.Add(" MAIORES PASTAS")
+    $report.Add("========================================")
+
+    foreach ($folder in $topFolders) {
+        $report.Add(("{0,8:N2} GB  {1}" -f $folder.GB, $folder.Path))
+    }
+
+    $report.Add("")
+    $report.Add("========================================")
+    $report.Add(" MAIORES ARQUIVOS")
+    $report.Add("========================================")
+
+    foreach ($file in ($files | Sort-Object GB -Descending | Select-Object -First ($Top * 2))) {
+        $report.Add(("{0,8:N2} GB  {1}" -f $file.GB, $file.Path))
+    }
+
+    $report.Add("")
+    $report.Add("========================================")
+    $report.Add(" INVESTIGAÇÃO POR NÍVEL")
+    $report.Add("========================================")
+
+    for ($level = 1; $level -le $Depth; $level++) {
+
+        $report.Add("")
+        $report.Add("--- NÍVEL $level ---")
+
+        $levelFolders = $results |
+            Where-Object {
+                $_.Depth -eq $level -and
+                $_.GB -ge $MinGB
+            } |
+            Sort-Object GB -Descending |
+            Select-Object -First ($Top * $level)
+
+        foreach ($folder in $levelFolders) {
+            $report.Add(("{0,8:N2} GB  {1}" -f $folder.GB, $folder.Path))
+        }
+    }
+
+    $report | Out-File -FilePath $Output -Encoding UTF8
+
+    Write-Host $Output -ForegroundColor Green
+
+    return [PSCustomObject]@{
+        Disco           = if ($disk) { $disk.DeviceID } else { $null }
+        TotalGB         = $total
+        UsadoGB         = $used
+        LivreGB         = $free
+        MaioresPastas   = $topFolders
+        MaioresArquivos = $files |
+            Sort-Object GB -Descending |
+            Select-Object -First ($Top * 2)
+        Relatorio       = $Output
+    }
+}
